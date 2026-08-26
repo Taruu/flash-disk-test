@@ -19,7 +19,7 @@ flash-test — Simple one-drive flash tester
 
 Pipeline (one stick per run):
   SMART preflight (optional long self-test → exit & re-run)
-  smartctl -a → f3probe --destructive → badblocks -wsv → hdparm → mkfs.exfat → fsck
+  smartctl -a → f3probe --verbose --destructive → badblocks -wsv → hdparm → mkfs.exfat → fsck
 
 If the disk supports SMART self-tests, you can start a long offline test;
 flash-test exits and you re-run later to read the result before destructive steps.

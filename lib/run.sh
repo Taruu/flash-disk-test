@@ -148,12 +148,17 @@ smart_has_selftest_state() {
   [[ -f "$(smart_state_path "$uuid")" ]]
 }
 
-# Dump smartctl -a (best-effort). Returns 0 always; prints "unsupported" on failure.
+# Dump smartctl health (best-effort, verbose). Returns 0 always.
 smart_dump_all() {
   local dev="$1"
   local rc=0
-  echo "[smartctl] smartctl -a $dev"
-  smartctl -a "$dev" || rc=$?
+  # -x is more verbose than -a when supported
+  local cmd=(smartctl -x)
+  if ! smartctl -h 2>&1 | grep -qE -- '(^|[[:space:]])-x([[:space:]]|,|$)|--xall'; then
+    cmd=(smartctl -a)
+  fi
+  echo "[smartctl] ${cmd[*]} $dev"
+  "${cmd[@]}" "$dev" || rc=$?
   # smartctl exit codes are bitflags; bits 0–1 mean CLI/open failure
   if (( (rc & 3) != 0 )); then
     echo "[smartctl] unsupported or failed (rc=$rc) — continuing"
@@ -357,7 +362,14 @@ run_drive_pipeline() {
 
   # 2) Fake capacity
   _set_step "f3probe"
-  if ! f3probe --destructive --time-ops "$resolved"; then
+  local f3_cmd=(f3probe --destructive --time-ops)
+  if f3probe --help 2>&1 | grep -qE -- '--verbose'; then
+    f3_cmd=(f3probe --verbose --destructive --time-ops)
+  else
+    echo "[f3probe] note: this f3probe build has no --verbose (need f3 ≥10 / git); continuing with --time-ops"
+  fi
+  echo "[f3probe] ${f3_cmd[*]} $resolved"
+  if ! "${f3_cmd[@]}" "$resolved"; then
     rc=$?
     echo "error: f3probe failed (rc=$rc)"
     _finish_status "FAILED" "FAKE_OR_F3"
@@ -367,8 +379,9 @@ run_drive_pipeline() {
   umount_device_tree "$resolved"
   assert_unmounted "$resolved" || true
 
-  # 3) Bad sectors
+  # 3) Bad sectors (-s progress, -v verbose)
   _set_step "badblocks"
+  echo "[badblocks] badblocks -wsv $resolved"
   if ! badblocks -wsv "$resolved"; then
     rc=$?
     echo "error: badblocks failed (rc=$rc)"
@@ -378,7 +391,8 @@ run_drive_pipeline() {
 
   # 4) Speed
   _set_step "hdparm"
-  if ! hdparm -Tt "$resolved"; then
+  echo "[hdparm] hdparm -v -Tt $resolved"
+  if ! hdparm -v -Tt "$resolved"; then
     echo "[hdparm] failed — continuing"
   fi
 
@@ -392,13 +406,15 @@ run_drive_pipeline() {
       return 1
     fi
 
-    echo "[format] wipefs -a $resolved"
-    wipefs -a "$resolved"
+    echo "[format] wipefs -av $resolved"
+    wipefs -av "$resolved"
 
-    echo "[format] parted: mklabel msdos + primary partition"
+    echo "[format] parted -s $resolved mklabel msdos + mkpart primary 1MiB 100%"
     parted -s "$resolved" mklabel msdos
     parted -s "$resolved" mkpart primary 1MiB 100%
     udevadm settle 2>/dev/null || sleep 1
+    echo "[format] partition table:"
+    parted -s "$resolved" print || true
 
     local part=""
     part="$(lsblk -ln -o NAME,TYPE "$resolved" | awk '$2=="part"{print "/dev/"$1; exit}')"
@@ -416,8 +432,8 @@ run_drive_pipeline() {
       return 1
     fi
 
-    echo "[format] mkfs.exfat $part"
-    mkfs.exfat "$part"
+    echo "[format] mkfs.exfat -v $part"
+    mkfs.exfat -v "$part"
 
     _set_step "fsck"
     echo "[fsck] fsck.exfat -v $part"
