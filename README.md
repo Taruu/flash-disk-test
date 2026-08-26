@@ -1,10 +1,16 @@
 # flash-test — Simple one-drive flash tester
 
-Bash TUI that tests **one** USB flash drive: fake capacity (`f3probe`), surface (`badblocks`), SMART (`smartctl`), speed (`hdparm`), then optional exFAT reformat + `fsck`.
+Bash TUI that tests **one** USB flash drive: SMART (`smartctl`), fake capacity (`f3probe`), surface (`badblocks`), speed (`hdparm`), then optional exFAT reformat + `fsck`.
 
 ## Warning
 
-**Destructive.** Only removable (`RM=1`) disks that are not the system disk are accepted. You must type `yes` before tests start, and again before formatting.
+**Destructive** after the SMART gate. Only removable (`RM=1`) disks that are not the system disk are accepted. You must type `yes` before destructive tests start, and again before formatting.
+
+## SMART self-test
+
+If the stick supports SMART self-tests, flash-test can start a **long offline** test and exit. Leave the drive plugged in, then run again later: it shows the self-test log and continues to the destructive pipeline.
+
+Pending state lives at `logs/<uuid>/smart-selftest.state`.
 
 ## Dependencies
 
@@ -32,7 +38,7 @@ logs/<uuid>/<YYYYMMDDTHHMMSS>.log
 ## Also
 
 ```bash
-./flash-test --list    # list safe removable targets (no root needed for list alone if readable)
+./flash-test --list    # list safe removable targets
 ./flash-test --help
 ```
 

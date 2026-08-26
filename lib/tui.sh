@@ -117,7 +117,7 @@ tui_confirm_destructive() {
   echo "  Serial: $serial" >&2
   echo "  Model:  $vendor $model ($size_h)" >&2
   echo "" >&2
-  echo "Pipeline: f3probe → badblocks -w → smartctl → hdparm → mkfs.exfat → fsck" >&2
+  echo "Pipeline: smartctl → f3probe → badblocks -w → hdparm → mkfs.exfat → fsck" >&2
   echo "" >&2
 
   stty echo icanon 2>/dev/null || true

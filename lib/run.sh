@@ -69,6 +69,226 @@ prepare_log_paths() {
   printf '%s\n' "$FLASH_TEST_LOG"
 }
 
+smart_state_path() {
+  local uuid="$1"
+  local root="${FLASH_TEST_ROOT:-.}"
+  local safe
+  safe="$(_safe_id "$uuid")"
+  mkdir -p "$root/logs/$safe"
+  echo "$root/logs/$safe/smart-selftest.state"
+}
+
+# Returns 0 if drive answers SMART queries.
+smart_available() {
+  local dev="$1"
+  local out
+  out="$(smartctl -i "$dev" 2>&1 || true)"
+  if echo "$out" | grep -qiE 'SMART support is:[[:space:]]*(Available|Enabled)'; then
+    return 0
+  fi
+  # USB bridges sometimes omit that line but still answer -H/-a
+  if smartctl -H "$dev" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+# Returns 0 if offline/conveyance/short/long self-test looks available.
+smart_selftest_supported() {
+  local dev="$1"
+  local caps
+  caps="$(smartctl -c "$dev" 2>/dev/null || true)"
+  if echo "$caps" | grep -qiE 'Self-test[[:space:]].*(available|supported)|Selective self-test|Short self-test|Extended self-test'; then
+    return 0
+  fi
+  # Fallback: try dry capability via -t options in help text is useless; probe -l selftest
+  if smartctl -l selftest "$dev" >/dev/null 2>&1; then
+    # Have a log page — often implies self-test capability even if -c is sparse
+    if echo "$caps" | grep -qiE 'Offline data collection|Self-test execution status'; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Returns 0 if a self-test is currently running on the drive.
+smart_selftest_in_progress() {
+  local dev="$1"
+  local info
+  info="$(smartctl -c "$dev" 2>/dev/null || smartctl -a "$dev" 2>/dev/null || true)"
+  echo "$info" | grep -qiE 'Self-test execution status:.*in progress|[0-9]+% of test remaining'
+}
+
+smart_selftest_progress_line() {
+  local dev="$1"
+  smartctl -c "$dev" 2>/dev/null | grep -iE 'Self-test execution status' | head -n1 || \
+    smartctl -a "$dev" 2>/dev/null | grep -iE 'Self-test execution status' | head -n1 || \
+    echo "(no progress line)"
+}
+
+smart_save_selftest_state() {
+  local uuid="$1" dev="$2" test="${3:-long}"
+  local path
+  path="$(smart_state_path "$uuid")"
+  cat >"$path" <<EOF
+uuid=$uuid
+dev=$dev
+test=$test
+started_at=$(date -Iseconds)
+EOF
+}
+
+smart_clear_selftest_state() {
+  local uuid="$1"
+  rm -f "$(smart_state_path "$uuid")"
+}
+
+smart_has_selftest_state() {
+  local uuid="$1"
+  [[ -f "$(smart_state_path "$uuid")" ]]
+}
+
+# Dump smartctl -a (best-effort). Returns 0 always; prints "unsupported" on failure.
+smart_dump_all() {
+  local dev="$1"
+  local rc=0
+  echo "[smartctl] smartctl -a $dev"
+  smartctl -a "$dev" || rc=$?
+  # smartctl exit codes are bitflags; bits 0–1 mean CLI/open failure
+  if (( (rc & 3) != 0 )); then
+    echo "[smartctl] unsupported or failed (rc=$rc) — continuing"
+  elif (( rc != 0 )); then
+    echo "[smartctl] completed with status bits rc=$rc — continuing"
+  fi
+  return 0
+}
+
+# Start offline self-test (firmware runs it; smartctl returns after arming).
+# test: short|long (default long)
+smart_start_selftest() {
+  local dev="$1"
+  local test="${2:-long}"
+  local rc=0
+  echo "[smartctl] starting offline self-test: smartctl -t $test $dev"
+  smartctl -t "$test" "$dev" || rc=$?
+  if (( (rc & 3) != 0 )); then
+    echo "[smartctl] failed to start self-test (rc=$rc)"
+    return 1
+  fi
+  if (( rc != 0 )); then
+    echo "[smartctl] self-test armed with status bits rc=$rc"
+  fi
+  return 0
+}
+
+# Interactive SMART gate before destructive tests.
+# Prints to stderr for UI; may write a small smart log under logs/<uuid>/.
+# Return codes for caller:
+#   0  — continue with destructive pipeline
+#   10 — self-test started; exit the app
+#   11 — self-test still running; exit the app
+smart_preflight() {
+  local meta="$1"
+  local by_id resolved serial vendor model size_b size_h usb uuid
+  IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$meta"
+
+  local root="${FLASH_TEST_ROOT:-.}"
+  local safe log
+  safe="$(_safe_id "$uuid")"
+  mkdir -p "$root/logs/$safe"
+  log="$root/logs/$safe/smart-$(date +%Y%m%dT%H%M%S).log"
+
+  {
+    echo "=== SMART preflight ==="
+    echo "uuid=$uuid resolved=$resolved"
+    echo "started=$(date -Iseconds)"
+    echo ""
+  } | tee -a "$log" >&2
+
+  # Always attempt identity / health dump first
+  {
+    if ! smart_available "$resolved"; then
+      echo "[smartctl] unsupported — skipping self-test gate"
+      echo "[smartctl] unsupported — continuing"
+    else
+      smart_dump_all "$resolved"
+    fi
+  } 2>&1 | tee -a "$log" >&2
+
+  if ! smart_available "$resolved"; then
+    return 0
+  fi
+
+  # Pending self-test from a previous run?
+  if smart_has_selftest_state "$uuid"; then
+    echo "" >&2
+    echo "[smartctl] Found pending self-test state for UUID $uuid" >&2
+    if smart_selftest_in_progress "$resolved"; then
+      echo "[smartctl] Self-test still running:" >&2
+      smart_selftest_progress_line "$resolved" >&2
+      echo "" >&2
+      echo "Re-run flash-test later to read the result, then continue destructive tests." >&2
+      echo "SMART log: $log" >&2
+      return 11
+    fi
+
+    echo "[smartctl] Self-test finished — latest log:" >&2
+    {
+      echo "--- smartctl -l selftest ---"
+      smartctl -l selftest "$resolved" || echo "[smartctl] could not read self-test log"
+      echo "--- smartctl -H ---"
+      smartctl -H "$resolved" || true
+    } 2>&1 | tee -a "$log" >&2
+    smart_clear_selftest_state "$uuid"
+    echo "" >&2
+    echo "[smartctl] Cleared pending state. Continuing to destructive tests." >&2
+    echo "SMART log: $log" >&2
+    return 0
+  fi
+
+  if ! smart_selftest_supported "$resolved"; then
+    echo "[smartctl] Self-test not available on this disk — continuing" >&2
+    echo "SMART log: $log" >&2
+    return 0
+  fi
+
+  echo "" >&2
+  echo "[smartctl] This disk supports SMART self-tests." >&2
+  echo "  A long offline self-test runs on the drive firmware (can take hours)." >&2
+  echo "  flash-test will start it and exit; re-run later to see the result." >&2
+  echo "" >&2
+  stty echo icanon 2>/dev/null || true
+  local answer
+  read -r -p "Type 'yes' to start SMART long self-test and EXIT (anything else = skip): " answer
+  if [[ "$answer" != "yes" ]]; then
+    echo "[smartctl] Self-test skipped — continuing" >&2
+    echo "SMART log: $log" >&2
+    return 0
+  fi
+
+  local start_log
+  start_log="$(mktemp)"
+  set +e
+  smart_start_selftest "$resolved" long >"$start_log" 2>&1
+  local start_rc=$?
+  set -e
+  tee -a "$log" <"$start_log" >&2
+  rm -f "$start_log"
+
+  if [[ $start_rc -ne 0 ]]; then
+    echo "[smartctl] Self-test not started — continuing" >&2
+    echo "SMART log: $log" >&2
+    return 0
+  fi
+
+  smart_save_selftest_state "$uuid" "$resolved" long
+  echo "" >&2
+  echo "[smartctl] Self-test armed. State: $(smart_state_path "$uuid")" >&2
+  echo "Leave the drive plugged in. Re-run: sudo ./flash-test" >&2
+  echo "SMART log: $log" >&2
+  return 10
+}
+
 # Run the full pipeline for one drive metadata line.
 # meta: by_id|resolved|serial|vendor|model|size_b|size_h|usb|uuid
 # do_format: 0|1
@@ -114,7 +334,11 @@ run_drive_pipeline() {
 
   local rc=0
 
-  # 1) Fake capacity
+  # 1) SMART health dump (best-effort; before destructive fake probe)
+  _set_step "smartctl"
+  smart_dump_all "$resolved"
+
+  # 2) Fake capacity
   _set_step "f3probe"
   if ! f3probe --destructive --time-ops "$resolved"; then
     rc=$?
@@ -126,19 +350,13 @@ run_drive_pipeline() {
   umount_device_tree "$by_id"
   assert_unmounted "$by_id" || true
 
-  # 2) Bad sectors
+  # 3) Bad sectors
   _set_step "badblocks"
   if ! badblocks -wsv "$resolved"; then
     rc=$?
     echo "error: badblocks failed (rc=$rc)"
     _finish_status "FAILED" "BADBLOCKS"
     return "$rc"
-  fi
-
-  # 3) SMART (best-effort)
-  _set_step "smartctl"
-  if ! smartctl -a "$resolved"; then
-    echo "[smartctl] unsupported or failed — continuing"
   fi
 
   # 4) Speed

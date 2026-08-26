@@ -17,8 +17,12 @@ usage() {
   cat <<'EOF'
 flash-test — Simple one-drive flash tester
 
-Destructive pipeline (one stick per run):
-  f3probe --destructive → badblocks -wsv → smartctl → hdparm → mkfs.exfat → fsck
+Pipeline (one stick per run):
+  SMART preflight (optional long self-test → exit & re-run)
+  smartctl -a → f3probe --destructive → badblocks -wsv → hdparm → mkfs.exfat → fsck
+
+If the disk supports SMART self-tests, you can start a long offline test;
+flash-test exits and you re-run later to read the result before destructive steps.
 
 Usage:
   flash-test              Interactive TUI: pick one drive
@@ -27,6 +31,8 @@ Usage:
 
 Logs:
   logs/<uuid>/<YYYYMMDDTHHMMSS>.log
+  logs/<uuid>/smart-*.log
+  logs/<uuid>/smart-selftest.state   (while a self-test is pending)
 EOF
 }
 
@@ -61,6 +67,25 @@ main() {
 
   local by_id resolved serial vendor model size_b size_h usb uuid
   IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$meta"
+
+  # SMART first: dump health; optionally arm self-test and exit for next run
+  local smart_rc=0
+  smart_preflight "$meta" || smart_rc=$?
+  case "$smart_rc" in
+    0) ;;
+    10)
+      echo "Exiting so the SMART self-test can finish. Re-run when done." >&2
+      exit 0
+      ;;
+    11)
+      echo "Exiting: SMART self-test still in progress." >&2
+      exit 0
+      ;;
+    *)
+      echo "SMART preflight failed (rc=$smart_rc) — aborting." >&2
+      exit "$smart_rc"
+      ;;
+  esac
 
   if ! tui_confirm_destructive "$meta"; then
     echo "Aborted." >&2
