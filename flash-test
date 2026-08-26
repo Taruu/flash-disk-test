@@ -216,40 +216,41 @@ main() {
   format="$FLASH_TEST_FORMAT"
 
   mkdir -p "$output"
+  rm -f "$output/.live_done"
   echo "Reports → $output" >&2
 
-  # Run batch in background so live TUI can poll; wait in parent
-  FLASH_TEST_LIVE_DONE=0
+  # Run batch in background so live TUI can poll; only the parent may wait on it.
   local batch_rc=0
   (
-    runner_run_batch "$jobs" "$write_jobs" "$output" "$mode" "$format" "${metas[@]}"
+    # Keep worker stdout/stderr out of the TUI; stages already append to per-drive logs.
+    runner_run_batch "$jobs" "$write_jobs" "$output" "$mode" "$format" "${metas[@]}" \
+      >/dev/null 2>&1
   ) &
   local batch_pid=$!
 
-  # Live view while batch runs
-  (
-    wait "$batch_pid" || true
-    FLASH_TEST_LIVE_DONE=1
-    # Signal via file for subshell visibility
-    echo 1 >"$output/.live_done"
-  ) &
-  local waiter_pid=$!
-
-  # Override live done check to use file (subshell env isolation)
-  # Patch: poll file inside a wrapper
   _live_until_done() {
     local report_dir="$1"
     local focus=0
     local key
+    local batch_done=0
+
+    _batch_finished() {
+      if ! kill -0 "$batch_pid" 2>/dev/null; then
+        return 0
+      fi
+      return 1
+    }
+
     if [[ ! -t 1 ]]; then
-      while [[ ! -f "$report_dir/.live_done" ]]; do sleep 0.5; done
-      wait "$batch_pid" || batch_rc=$?
+      while ! _batch_finished; do sleep 0.5; done
       return 0
     fi
+
     tui_alt_on
     tui_hide_cursor
     stty -echo -icanon time 1 min 0 2>/dev/null || true
     trap 'tui_show_cursor; stty echo icanon 2>/dev/null || true; tui_alt_off' EXIT
+
     while true; do
       local -a status_files=()
       mapfile -t status_files < <(find "$report_dir" -maxdepth 1 -name '*.status' 2>/dev/null | sort)
@@ -286,13 +287,16 @@ main() {
       else
         echo "(no log yet)"
       fi
-      if [[ -f "$report_dir/.live_done" ]]; then
+
+      if _batch_finished; then
+        batch_done=1
         echo ""
         echo "══ batch complete — press any key ══"
         stty -echo -icanon time 0 min 1 2>/dev/null || true
         IFS= read -r -n1 _ || true
         break
       fi
+
       key=""
       IFS= read -r -n1 -t 0.5 key || true
       if [[ "$key" == $'\033' ]]; then
@@ -308,16 +312,22 @@ main() {
         k) ((${#status_files[@]} > 0)) && focus=$(( (focus - 1 + ${#status_files[@]} ) % ${#status_files[@]} )) ;;
       esac
     done
+
     tui_show_cursor
     stty echo icanon 2>/dev/null || true
     tui_alt_off
     trap - EXIT
+
+    # If user detached early, wait quietly for batch to finish.
+    if [[ $batch_done -eq 0 ]]; then
+      echo "Detached from live view — waiting for batch to finish…" >&2
+      while ! _batch_finished; do sleep 0.5; done
+    fi
   }
 
   _live_until_done "$output"
   wait "$batch_pid" || batch_rc=$?
-  wait "$waiter_pid" 2>/dev/null || true
-
+  echo 1 >"$output/.live_done"
   # Annotate skipped_no_confirm on status files if needed
   if [[ -n "$FLASH_TEST_FORMAT_OUTCOME_NOTE" ]]; then
     local sf
