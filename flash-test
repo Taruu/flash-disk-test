@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flash-test — Simple one-drive flash QA (TUI)
+# flash-test — Simple one-drive flash QA (TUI + CLI)
 set -euo pipefail
 
 FLASH_TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,16 +18,23 @@ usage() {
 flash-test — Simple one-drive flash tester
 
 Pipeline (one stick per run):
-  SMART preflight (optional long self-test → exit & re-run)
-  smartctl -a → f3probe --verbose --destructive → badblocks -wsv → hdparm → mkfs.exfat → fsck
-
-If the disk supports SMART self-tests, you can start a long offline test;
-flash-test exits and you re-run later to read the result before destructive steps.
+  SMART preflight (optional long self-test → exit & re-run; skipped in --yes CLI)
+  smartctl -x → f3probe --verbose --destructive → badblocks -wsv → hdparm → mkfs.exfat → fsck
 
 Usage:
-  flash-test              Interactive TUI: pick one drive
-  flash-test --list       List safe removable targets
+  flash-test                         Interactive TUI: pick one drive
+  flash-test --list                  List safe removable targets
+  flash-test --yes /dev/sdX          Non-interactive: test this drive (no prompts)
+  flash-test --yes --no-format /dev/sdX
   flash-test --help
+
+Options:
+  --yes              Required for CLI device runs; skip all confirmations
+  --no-format        Skip exFAT reformat after tests (default with --yes: format)
+  --format none|exfat
+                     Same as --no-format when none; exfat is default
+  --list             List removable targets
+  -h, --help         Show help
 
 Logs:
   logs/<uuid>/<YYYYMMDDTHHMMSS>.log
@@ -36,41 +43,20 @@ Logs:
 EOF
 }
 
-main() {
-  case "${1:-}" in
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --list)
-      list_drives_human
-      exit 0
-      ;;
-    "")
-      ;;
-    *)
-      echo "error: unknown argument: $1 (this app is TUI-only; use --list or --help)" >&2
-      usage >&2
-      exit 2
-      ;;
-  esac
-
-  require_root
-  check_dependencies
-
-  local meta
-  if ! meta="$(tui_pick_drive)"; then
-    echo "Aborted (no drive selected)." >&2
-    exit 1
-  fi
-  [[ -n "$meta" ]] || { echo "error: empty selection" >&2; exit 1; }
+# Run SMART gate + destructive pipeline for one metadata line.
+# Args: meta, do_format (0|1), noninteractive (0|1)
+run_selected_drive() {
+  local meta="$1"
+  local do_format="$2"
+  local noninteractive="${3:-0}"
 
   local by_id resolved serial vendor model size_b size_h usb uuid
   IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$meta"
 
-  # SMART first: dump health; optionally arm self-test and exit for next run
+  echo "Target: $resolved  UUID=$uuid  serial=$serial  $vendor $model ($size_h)" >&2
+
   local smart_rc=0
-  smart_preflight "$meta" || smart_rc=$?
+  smart_preflight "$meta" "$noninteractive" || smart_rc=$?
   case "$smart_rc" in
     0) ;;
     10)
@@ -87,13 +73,16 @@ main() {
       ;;
   esac
 
-  if ! tui_confirm_destructive "$meta"; then
-    echo "Aborted." >&2
-    exit 1
+  if [[ "$noninteractive" != "1" ]]; then
+    if ! tui_confirm_destructive "$meta"; then
+      echo "Aborted." >&2
+      exit 1
+    fi
+    do_format="$(tui_confirm_format "$meta")"
+  else
+    print_destructive_banner >&2
+    echo "[cli] --yes: skipping prompts (format=$do_format)" >&2
   fi
-
-  local do_format
-  do_format="$(tui_confirm_format "$meta")"
 
   local rc=0
   run_pipeline_fg "$meta" "$do_format" || rc=$?
@@ -104,6 +93,105 @@ main() {
   echo "Result: ${result:-?}  (exit $rc)" >&2
   echo "Log:    $FLASH_TEST_LOG" >&2
   exit "$rc"
+}
+
+main() {
+  local yes=0
+  local do_format=1
+  local list_only=0
+  local user_dev=""
+
+  while (( $# > 0 )); do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --list)
+        list_only=1
+        shift
+        ;;
+      --yes|-y)
+        yes=1
+        shift
+        ;;
+      --no-format)
+        do_format=0
+        shift
+        ;;
+      --format)
+        shift
+        case "${1:-}" in
+          none|skip) do_format=0 ;;
+          exfat) do_format=1 ;;
+          "")
+            echo "error: --format needs none|exfat" >&2
+            exit 2
+            ;;
+          *)
+            echo "error: unsupported --format '$1' (use none|exfat)" >&2
+            exit 2
+            ;;
+        esac
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        echo "error: unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+      *)
+        if [[ -n "$user_dev" ]]; then
+          echo "error: extra argument: $1" >&2
+          exit 2
+        fi
+        user_dev="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ $list_only -eq 1 ]]; then
+    list_drives_human
+    exit 0
+  fi
+
+  if [[ -n "$user_dev" && $yes -ne 1 ]]; then
+    echo "error: device given without --yes (refusing to destroy data non-interactively)" >&2
+    echo "hint: sudo ./flash-test --yes $user_dev" >&2
+    exit 2
+  fi
+
+  if [[ $yes -eq 1 && -z "$user_dev" ]]; then
+    echo "error: --yes requires a device path (e.g. /dev/sdb)" >&2
+    echo "hint: sudo ./flash-test --yes /dev/sdb" >&2
+    exit 2
+  fi
+
+  require_root
+  check_dependencies
+
+  local meta=""
+
+  if [[ -n "$user_dev" ]]; then
+    if ! meta="$(collect_device_metadata "$user_dev")"; then
+      echo "error: not a safe removable target: $user_dev" >&2
+      exit 1
+    fi
+    run_selected_drive "$meta" "$do_format" 1
+  fi
+
+  # Interactive TUI
+  if ! meta="$(tui_pick_drive)"; then
+    echo "Aborted (no drive selected)." >&2
+    exit 1
+  fi
+  [[ -n "$meta" ]] || { echo "error: empty selection" >&2; exit 1; }
+  run_selected_drive "$meta" "$do_format" 0
 }
 
 main "$@"

@@ -187,13 +187,15 @@ smart_start_selftest() {
 }
 
 # Interactive SMART gate before destructive tests.
-# Prints to stderr for UI; may write a small smart log under logs/<uuid>/.
+# Args: meta [, noninteractive=0]
+# When noninteractive=1: dump SMART, honor pending self-test state, never ask to start a new one.
 # Return codes for caller:
 #   0  — continue with destructive pipeline
 #   10 — self-test started; exit the app
 #   11 — self-test still running; exit the app
 smart_preflight() {
   local meta="$1"
+  local noninteractive="${2:-0}"
   local by_id resolved serial vendor model size_b size_h usb uuid
   IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$meta"
 
@@ -206,6 +208,7 @@ smart_preflight() {
   {
     echo "=== SMART preflight ==="
     echo "uuid=$uuid resolved=$resolved"
+    echo "noninteractive=$noninteractive"
     echo "started=$(date -Iseconds)"
     echo ""
   } | tee -a "$log" >&2
@@ -253,6 +256,12 @@ smart_preflight() {
 
   if ! smart_selftest_supported "$resolved"; then
     echo "[smartctl] Self-test not available on this disk — continuing" >&2
+    echo "SMART log: $log" >&2
+    return 0
+  fi
+
+  if [[ "$noninteractive" == "1" ]]; then
+    echo "[smartctl] Self-test available — skipped in non-interactive mode" >&2
     echo "SMART log: $log" >&2
     return 0
   fi

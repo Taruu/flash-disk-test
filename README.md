@@ -21,7 +21,12 @@ sudo apt install f3 e2fsprogs smartmontools hdparm parted exfatprogs util-linux
 ## Quick start
 
 ```bash
+# Interactive
 sudo ./flash-test
+
+# Non-interactive (no prompts) — DESTROYS the drive
+sudo ./flash-test --yes /dev/sdb
+sudo ./flash-test --yes --no-format /dev/sdb
 ```
 
 - `j` / `k` — move
