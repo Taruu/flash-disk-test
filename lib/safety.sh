@@ -32,7 +32,10 @@ check_dependencies() {
 pin_device_by_id() {
   local dev="$1"
   local resolved link candidate
-  resolved="$(realpath -e "$dev" 2>/dev/null || true)"
+  resolved="$(realpath -e "$dev" 2>/dev/null || readlink -f "$dev" 2>/dev/null || true)"
+  if [[ -z "$resolved" && -b "$dev" ]]; then
+    resolved="$dev"
+  fi
   if [[ -z "$resolved" ]]; then
     echo "error: device not found: $dev" >&2
     return 1
@@ -40,9 +43,9 @@ pin_device_by_id() {
 
   shopt -s nullglob
   for link in /dev/disk/by-id/*; do
-    [[ -e "$link" ]] || continue
+    [[ -e "$link" || -L "$link" ]] || continue
     [[ "$link" == *-part* ]] && continue
-    candidate="$(realpath -e "$link" 2>/dev/null || true)"
+    candidate="$(realpath -e "$link" 2>/dev/null || readlink -f "$link" 2>/dev/null || true)"
     if [[ "$candidate" == "$resolved" ]]; then
       echo "$link"
       shopt -u nullglob
@@ -50,9 +53,9 @@ pin_device_by_id() {
     fi
   done
   for link in /dev/disk/by-path/*; do
-    [[ -e "$link" ]] || continue
+    [[ -e "$link" || -L "$link" ]] || continue
     [[ "$link" == *-part* ]] && continue
-    candidate="$(realpath -e "$link" 2>/dev/null || true)"
+    candidate="$(realpath -e "$link" 2>/dev/null || readlink -f "$link" 2>/dev/null || true)"
     if [[ "$candidate" == "$resolved" ]]; then
       echo "$link"
       shopt -u nullglob
@@ -61,7 +64,24 @@ pin_device_by_id() {
   done
   shopt -u nullglob
 
-  echo "error: could not resolve by-id for $dev ($resolved)" >&2
+  # USB by-id can be flaky (names with ':'); fall back to kernel node.
+  echo "$resolved"
+  return 0
+}
+
+# Resolve any /dev path or by-id symlink to a kernel block node.
+resolve_dev_node() {
+  local dev="$1"
+  local resolved
+  if [[ -b "$dev" ]]; then
+    realpath -e "$dev" 2>/dev/null || readlink -f "$dev" 2>/dev/null || echo "$dev"
+    return 0
+  fi
+  resolved="$(realpath -e "$dev" 2>/dev/null || readlink -f "$dev" 2>/dev/null || true)"
+  if [[ -n "$resolved" && -b "$resolved" ]]; then
+    echo "$resolved"
+    return 0
+  fi
   return 1
 }
 
@@ -138,7 +158,7 @@ validate_target_device() {
   local dev="$1"
   local resolved name rm ro typ
 
-  resolved="$(realpath -e "$dev" 2>/dev/null || true)"
+  resolved="$(resolve_dev_node "$dev" 2>/dev/null || true)"
   if [[ -z "$resolved" ]]; then
     echo "skip: not found: $dev" >&2
     return 1
@@ -185,7 +205,7 @@ assert_unmounted() {
 umount_device_tree() {
   local dev="$1"
   local resolved parts p
-  resolved="$(realpath -e "$dev" 2>/dev/null || true)"
+  resolved="$(resolve_dev_node "$dev" 2>/dev/null || true)"
   [[ -z "$resolved" ]] && return 0
 
   mapfile -t parts < <(lsblk -ln -o NAME,TYPE "$resolved" | awk '$2=="part"{print "/dev/"$1}')

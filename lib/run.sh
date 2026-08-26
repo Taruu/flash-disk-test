@@ -301,7 +301,6 @@ run_drive_pipeline() {
   local by_id resolved serial vendor model size_b size_h usb uuid
   IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$meta"
 
-  FLASH_TEST_ACTIVE_DEV="$by_id"
   FLASH_TEST_RESULT="PENDING"
   trap runner_on_signal INT TERM
 
@@ -316,16 +315,34 @@ run_drive_pipeline() {
     echo ""
   }
 
-  if ! validate_target_device "$by_id"; then
+  # USB by-id symlinks (often …-0:0) can vanish between pick and run.
+  local fresh=""
+  if ! fresh="$(refresh_drive_meta "$meta")"; then
+    echo "error: validation failed (drive missing after refresh)"
+    _finish_status "FAILED" "UNSAFE"
+    return 1
+  fi
+  if [[ "$fresh" != "$meta" ]]; then
+    echo "[resolve] refreshed device path after re-probe"
+    echo "[resolve] was: $by_id -> $resolved"
+  fi
+  meta="$fresh"
+  IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$meta"
+  echo "[resolve] now: $by_id -> $resolved (uuid=$uuid)"
+
+  # Always validate/operate on the kernel node; by-id is advisory.
+  FLASH_TEST_ACTIVE_DEV="$resolved"
+
+  if ! validate_target_device "$resolved"; then
     echo "error: validation failed"
     _finish_status "FAILED" "UNSAFE"
     return 1
   fi
 
-  umount_device_tree "$by_id"
-  if ! assert_unmounted "$by_id"; then
-    umount_device_tree "$by_id"
-    if ! assert_unmounted "$by_id"; then
+  umount_device_tree "$resolved"
+  if ! assert_unmounted "$resolved"; then
+    umount_device_tree "$resolved"
+    if ! assert_unmounted "$resolved"; then
       echo "error: could not unmount"
       _finish_status "FAILED" "MOUNTED"
       return 1
@@ -347,8 +364,8 @@ run_drive_pipeline() {
     return "$rc"
   fi
 
-  umount_device_tree "$by_id"
-  assert_unmounted "$by_id" || true
+  umount_device_tree "$resolved"
+  assert_unmounted "$resolved" || true
 
   # 3) Bad sectors
   _set_step "badblocks"
@@ -368,8 +385,8 @@ run_drive_pipeline() {
   # 5) Reformat + fsck
   if [[ "$do_format" == "1" ]]; then
     _set_step "format"
-    umount_device_tree "$by_id"
-    if ! assert_unmounted "$by_id"; then
+    umount_device_tree "$resolved"
+    if ! assert_unmounted "$resolved"; then
       echo "error: could not unmount before format"
       _finish_status "FAILED" "MOUNTED"
       return 1

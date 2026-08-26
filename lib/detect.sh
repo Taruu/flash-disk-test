@@ -116,6 +116,49 @@ enumerate_removable_drives() {
   done < <(lsblk -dpno NAME,RM,TYPE 2>/dev/null | sed 's|^/dev/||' | awk '{print $1,$2,$3}')
 }
 
+# Re-find the stick after USB by-id symlinks race/vanish.
+# Prefer UUID, then serial, then still-present /dev/sdX node.
+# Prints a fresh metadata line on success.
+refresh_drive_meta() {
+  local meta="$1"
+  local by_id resolved serial vendor model size_b size_h usb uuid
+  IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$meta"
+
+  local line c_by_id c_resolved c_serial c_vendor c_model c_sb c_sh c_usb c_uuid
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    IFS='|' read -r c_by_id c_resolved c_serial c_vendor c_model c_sb c_sh c_usb c_uuid <<<"$line"
+    if [[ -n "$uuid" && "$c_uuid" == "$uuid" ]]; then
+      printf '%s\n' "$line"
+      return 0
+    fi
+  done < <(enumerate_removable_drives)
+
+  if [[ -n "$serial" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      IFS='|' read -r c_by_id c_resolved c_serial c_vendor c_model c_sb c_sh c_usb c_uuid <<<"$line"
+      if [[ "$c_serial" == "$serial" ]]; then
+        printf '%s\n' "$line"
+        return 0
+      fi
+    done < <(enumerate_removable_drives)
+  fi
+
+  # Stale by-id is common (usb-…-0:0); kernel node may still be valid.
+  if [[ -n "$resolved" && -b "$resolved" ]]; then
+    collect_device_metadata "$resolved" && return 0
+  fi
+
+  if [[ -n "$by_id" ]] && { [[ -e "$by_id" ]] || [[ -L "$by_id" ]]; }; then
+    collect_device_metadata "$by_id" && return 0
+  fi
+
+  echo "error: drive not present anymore (uuid=${uuid:-?} serial=${serial:-?} was ${resolved:-?})" >&2
+  return 1
+}
+
 list_drives_human() {
   local line by_id resolved serial vendor model size_b size_h usb uuid
   local found=0
