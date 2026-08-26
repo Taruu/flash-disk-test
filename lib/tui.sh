@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interactive TUI: drive picker, format confirmation, live progress + logs.
+# Single-drive TUI: pick one stick, show UUID, confirm format, live progress + log.
 
 set -euo pipefail
 
@@ -10,66 +10,89 @@ tui_alt_on() { printf '\033[?1049h'; }
 tui_alt_off() { printf '\033[?1049l'; }
 
 # ---------------------------------------------------------------------------
-# Drive picker
-# Args: allow_loop
-# Prints selected metadata lines to stdout; returns 0 on confirm, 1 on quit.
+# Pick exactly one drive. Prints one metadata line to stdout.
+# Restores cursor onto previously saved UUID when still plugged in.
 # ---------------------------------------------------------------------------
-tui_pick_drives() {
+tui_pick_drive() {
   local allow_loop="${1:-0}"
   local -a metas=()
-  local -a selected=()
   local cursor=0
   local i key
+  local saved_uuid="" saved_by_id=""
 
   if [[ ! -t 0 ]] || [[ ! -t 2 ]]; then
-    echo "error: --interactive requires a TTY" >&2
+    echo "error: interactive mode requires a TTY" >&2
     return 1
+  fi
+
+  if selection_load 2>/dev/null; then
+    saved_uuid="${SELECTION_UUID:-}"
+    saved_by_id="${SELECTION_BY_ID:-}"
   fi
 
   _reload() {
     metas=()
-    selected=()
     local line
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       metas+=("$line")
-      selected+=(0)
     done < <(enumerate_removable_drives "$allow_loop")
-    if ((cursor >= ${#metas[@]} && ${#metas[@]} > 0)); then
-      cursor=$((${#metas[@]} - 1))
+
+    cursor=0
+    if ((${#metas[@]} == 0)); then
+      return 0
     fi
-    ((${#metas[@]} == 0)) && cursor=0
+    # Prefer previously saved UUID
+    if [[ -n "$saved_uuid" || -n "$saved_by_id" ]]; then
+      for i in "${!metas[@]}"; do
+        local by_id resolved serial vendor model size_b size_h usb uuid
+        IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"${metas[$i]}"
+        if [[ -n "$saved_uuid" && "$uuid" == "$saved_uuid" ]]; then
+          cursor=$i
+          return 0
+        fi
+        if [[ -n "$saved_by_id" && "$by_id" == "$saved_by_id" ]]; then
+          cursor=$i
+          return 0
+        fi
+      done
+    fi
   }
 
   _draw() {
     tui_clear
     echo "╔══════════════════════════════════════════════════════════════════╗"
-    echo "║  flash-test — Select drives                                    ║"
-    echo "║  j/k or arrows move · space toggle · a all · r refresh         ║"
-    echo "║  enter or c confirm · q quit                                   ║"
+    echo "║  flash-test — Select ONE flash drive                           ║"
+    echo "║  j/k move · enter confirm · r refresh · q quit                 ║"
     echo "╚══════════════════════════════════════════════════════════════════╝"
     echo ""
-    if ((${#metas[@]} == 0)); then
-      echo "  (no removable drives found — plug in a stick and press r)"
-      echo "  tip: use --allow-loop for losetup mock devices"
-    else
-      for i in "${!metas[@]}"; do
-        local by_id resolved serial vendor model size_b size_h usb
-        IFS='|' read -r by_id resolved serial vendor model size_b size_h usb <<<"${metas[$i]}"
-        local mark=" "
-        [[ "${selected[$i]}" == "1" ]] && mark="x"
-        local prefix="  "
-        ((i == cursor)) && prefix="> "
-        printf '%s[%s] %-14s  %-18s  %8s  %-6s  %s %s\n' \
-          "$prefix" "$mark" "$(basename "$resolved")" "$serial" "$size_h" "$usb" "$vendor" "$model"
-      done
+    if [[ -n "$saved_uuid" ]]; then
+      echo "  Saved UUID: $saved_uuid"
+      echo "  State file: $(selection_path)"
+      echo ""
     fi
-    local nsel=0
-    for i in "${!selected[@]}"; do
-      [[ "${selected[$i]}" == "1" ]] && nsel=$((nsel + 1))
+    if ((${#metas[@]} == 0)); then
+      echo "  (no removable drives — plug in a stick and press r)"
+      echo "  tip: --allow-loop for losetup mocks"
+      return 0
+    fi
+    for i in "${!metas[@]}"; do
+      local by_id resolved serial vendor model size_b size_h usb uuid
+      IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"${metas[$i]}"
+      local prefix="  "
+      ((i == cursor)) && prefix="> "
+      local mark=" "
+      [[ -n "$saved_uuid" && "$uuid" == "$saved_uuid" ]] && mark="*"
+      printf '%s%c %-12s  UUID=%-22s  %8s  %-5s  %s\n' \
+        "$prefix" "$mark" "$(basename "$resolved")" "$uuid" "$size_h" "$usb" "$model"
     done
     echo ""
-    echo "  Selected: $nsel / ${#metas[@]}"
+    local cur_uuid=""
+    if ((${#metas[@]} > 0)); then
+      IFS='|' read -r _ _ _ _ _ _ _ _ cur_uuid <<<"${metas[$cursor]}"
+    fi
+    echo "  Highlighted UUID: ${cur_uuid:-—}"
+    echo "  (* = previously saved selection)"
   }
 
   _reload
@@ -99,78 +122,56 @@ tui_pick_drives() {
         return 1
         ;;
       r|R) _reload ;;
-      a|A)
-        local all_on=1
-        for i in "${!selected[@]}"; do
-          [[ "${selected[$i]}" == "0" ]] && all_on=0 && break
-        done
-        for i in "${!selected[@]}"; do
-          selected[$i]=$((1 - all_on))
-        done
-        ;;
-      " ")
-        if ((${#metas[@]} > 0)); then
-          selected[$cursor]=$((1 - selected[$cursor]))
-        fi
-        ;;
       j)
         ((${#metas[@]} > 0)) && cursor=$(( (cursor + 1) % ${#metas[@]} ))
         ;;
       k)
         ((${#metas[@]} > 0)) && cursor=$(( (cursor - 1 + ${#metas[@]} ) % ${#metas[@]} ))
         ;;
-      c|C|$'\n'|$'\r')
-        local any=0
-        for i in "${!selected[@]}"; do
-          [[ "${selected[$i]}" == "1" ]] && any=1 && break
-        done
-        if [[ $any -eq 0 ]]; then
+      $'\n'|$'\r'|c|C)
+        if ((${#metas[@]} == 0)); then
           continue
         fi
         tui_show_cursor; stty echo 2>/dev/null || true; tui_alt_off
         trap - EXIT
-        for i in "${!selected[@]}"; do
-          [[ "${selected[$i]}" == "1" ]] && printf '%s\n' "${metas[$i]}"
-        done
+        local chosen="${metas[$cursor]}"
+        selection_save "$chosen"
+        printf '%s\n' "$chosen"
         return 0
         ;;
     esac
   done
 }
 
-# ---------------------------------------------------------------------------
-# Format confirmation gate
-# ---------------------------------------------------------------------------
+# Format confirmation for one drive
 tui_confirm_format() {
   local fstype="$1"
-  shift
-  local -a metas=("$@")
+  local meta="$2"
 
   if [[ "$fstype" == "none" ]]; then
     FLASH_TEST_FORMAT_CONFIRMED=1
     return 0
   fi
 
+  local by_id resolved serial vendor model size_b size_h usb uuid
+  IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$meta"
+
   print_destructive_banner >&2
   echo "" >&2
-  echo "The following drives will be FORMATTED as $fstype after tests PASS:" >&2
+  echo "Drive will be FORMATTED as $fstype after tests PASS:" >&2
+  echo "  UUID:   $uuid" >&2
+  echo "  Device: $resolved" >&2
+  echo "  Serial: $serial" >&2
+  echo "  Model:  $vendor $model ($size_h)" >&2
   echo "" >&2
-  local i=1 meta by_id resolved serial vendor model size_b size_h usb
-  for meta in "${metas[@]}"; do
-    IFS='|' read -r by_id resolved serial vendor model size_b size_h usb <<<"$meta"
-    printf '  %2d. %s  serial=%s  size=%s  %s %s\n' \
-      "$i" "$resolved" "$serial" "$size_h" "$vendor" "$model" >&2
-    i=$((i + 1))
-  done
-  echo "" >&2
-  local n="${#metas[@]}"
-  local answer
+
   stty echo icanon 2>/dev/null || true
   tui_show_cursor
-  read -r -p "Type 'yes' to FORMAT all $n selected drives after tests pass: " answer
+  local answer
+  read -r -p "Type 'yes' to FORMAT this drive after tests pass: " answer
   if [[ "$answer" == "yes" ]]; then
     FLASH_TEST_FORMAT_CONFIRMED=1
-    echo "Format confirmed." >&2
+    echo "Format confirmed for UUID $uuid" >&2
     return 0
   fi
 
@@ -210,18 +211,19 @@ cli_confirm_format() {
   return 0
 }
 
-# ---------------------------------------------------------------------------
-# Live progress table + log pane
-# ---------------------------------------------------------------------------
-tui_live_view() {
+# Live view for a single running pipeline (poll status + tail log).
+# Args: report_dir, worker_pid, uuid
+tui_live_one() {
   local report_dir="$1"
-  local focus=0
-  local key
+  local worker_pid="$2"
+  local uuid="${3:-}"
+
+  _worker_alive() {
+    kill -0 "$worker_pid" 2>/dev/null
+  }
 
   if [[ ! -t 1 ]]; then
-    while [[ "${FLASH_TEST_LIVE_DONE:-0}" != "1" ]]; do
-      sleep 0.5
-    done
+    while _worker_alive; do sleep 0.5; done
     return 0
   fi
 
@@ -230,22 +232,19 @@ tui_live_view() {
   stty -echo -icanon time 1 min 0 2>/dev/null || true
   trap 'tui_show_cursor; stty echo icanon 2>/dev/null || true; tui_alt_off' EXIT
 
+  local done_shown=0
   while true; do
-    local -a status_files=()
-    mapfile -t status_files < <(find "$report_dir" -maxdepth 1 -name '*.status' 2>/dev/null | sort)
-
-    if ((focus >= ${#status_files[@]} && ${#status_files[@]} > 0)); then
-      focus=$((${#status_files[@]} - 1))
-    fi
+    local sf log=""
+    sf="$(find "$report_dir" -maxdepth 1 -name '*.status' 2>/dev/null | sort | tail -n1 || true)"
 
     tui_clear
-    printf 'DEV            SERIAL           STATUS     STEP        PROGRESS  SPEED              RESULT\n'
-    printf '─────────────────────────────────────────────────────────────────────────────────────────────\n'
-
-    local sf i=0
-    local focused_log=""
-    for sf in "${status_files[@]:-}"; do
-      local dev serial st step prog speed result log
+    echo "flash-test — single drive"
+    if [[ -n "$uuid" ]]; then
+      echo "UUID: $uuid"
+    fi
+    echo "────────────────────────────────────────────────────────────"
+    if [[ -n "$sf" && -f "$sf" ]]; then
+      local dev serial st step prog speed result
       dev="$(reporter_get "$sf" dev)"
       serial="$(reporter_get "$sf" serial)"
       st="$(reporter_get "$sf" status)"
@@ -254,56 +253,43 @@ tui_live_view() {
       speed="$(reporter_get "$sf" speed)"
       result="$(reporter_get "$sf" result)"
       log="$(reporter_get "$sf" log)"
-      local marker=" "
-      if ((i == focus)); then
-        marker=">"
-        focused_log="$log"
-      fi
-      printf '%s%-13s %-16s %-10s %-11s %-9s %-18s %s\n' \
-        "$marker" "$(basename "${dev:-?}")" "${serial:0:16}" "${st:0:10}" \
-        "${step:0:11}" "${prog:0:9}" "${speed:0:18}" "$result"
-      i=$((i + 1))
-    done
-
-    if ((${#status_files[@]} == 0)); then
-      echo "(waiting for workers…)"
+      local su
+      su="$(grep -E '^uuid=' "$sf" 2>/dev/null | cut -d= -f2- || true)"
+      [[ -n "$su" ]] && echo "UUID:    $su"
+      echo "Device:  $(basename "${dev:-?}")  ($dev)"
+      echo "Serial:  $serial"
+      echo "Status:  $st"
+      echo "Step:    $step   Progress: $prog"
+      echo "Speed:   $speed"
+      echo "Result:  $result"
+    else
+      echo "(starting…)"
     fi
-
-    printf '\n── log'
-    if [[ -n "$focused_log" ]]; then
-      printf ' (%s)' "$(basename "$focused_log")"
-    fi
-    printf '  [j/k focus · q detach] ──\n'
-    if [[ -n "$focused_log" && -f "$focused_log" ]]; then
-      tail -n 12 "$focused_log" 2>/dev/null || true
+    echo ""
+    echo "── log (q detach) ──"
+    if [[ -n "$log" && -f "$log" ]]; then
+      tail -n 16 "$log" 2>/dev/null || true
     else
       echo "(no log yet)"
     fi
 
-    if [[ "${FLASH_TEST_LIVE_DONE:-0}" == "1" ]]; then
-      echo ""
-      echo "══ batch complete — press any key ══"
-      stty -echo -icanon time 0 min 1 2>/dev/null || true
-      IFS= read -r -n1 _ || true
+    if ! _worker_alive; then
+      if [[ $done_shown -eq 0 ]]; then
+        done_shown=1
+        echo ""
+        echo "══ done — press any key ══"
+        stty -echo -icanon time 0 min 1 2>/dev/null || true
+        IFS= read -r -n1 _ || true
+      fi
       break
     fi
 
-    key=""
+    local key=""
     IFS= read -r -n1 -t 0.5 key || true
-    if [[ "$key" == $'\033' ]]; then
-      local r1 r2
-      IFS= read -r -n1 -t 0.05 r1 || true
-      IFS= read -r -n1 -t 0.05 r2 || true
-      [[ "$r2" == "A" ]] && key="k"
-      [[ "$r2" == "B" ]] && key="j"
-    fi
     case "$key" in
-      q|Q) break ;;
-      j)
-        ((${#status_files[@]} > 0)) && focus=$(( (focus + 1) % ${#status_files[@]} ))
-        ;;
-      k)
-        ((${#status_files[@]} > 0)) && focus=$(( (focus - 1 + ${#status_files[@]} ) % ${#status_files[@]} ))
+      q|Q)
+        echo "Detached — waiting for test to finish…" >&2
+        break
         ;;
     esac
   done
@@ -313,22 +299,5 @@ tui_live_view() {
   tui_alt_off
   trap - EXIT
 
-  echo ""
-  echo "Final results:"
-  mapfile -t status_files < <(find "$report_dir" -maxdepth 1 -name '*.status' 2>/dev/null | sort)
-  local passed=0 failed=0
-  for sf in "${status_files[@]:-}"; do
-    local result serial dev
-    result="$(reporter_get "$sf" result)"
-    serial="$(reporter_get "$sf" serial)"
-    dev="$(reporter_get "$sf" dev)"
-    printf '  %s  %s  %s\n' "$(basename "$dev")" "$serial" "$result"
-    if [[ "$result" == "PASSED" ]]; then
-      passed=$((passed + 1))
-    else
-      failed=$((failed + 1))
-    fi
-  done
-  echo "Passed: $passed  Failed: $failed"
-  echo "Reports: $report_dir"
+  while _worker_alive; do sleep 0.5; done
 }

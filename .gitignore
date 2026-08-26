@@ -1,4 +1,5 @@
 reports/**
 !reports/.gitkeep
+state/
 *.img
 /tmp/flash-test-mocks/

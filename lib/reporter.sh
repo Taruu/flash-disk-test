@@ -23,6 +23,7 @@ reporter_init_status() {
     echo "duration_sec="
     echo "dev="
     echo "serial="
+    echo "uuid="
     echo "by_id="
     echo "log="
     echo "error="
@@ -55,7 +56,7 @@ reporter_set_status() {
   {
     for k in status step progress speed result claimed_size real_size \
              write_bw_mbs read_bw_mbs write_iops read_iops format_outcome \
-             duration_sec dev serial by_id log error; do
+             duration_sec dev serial uuid by_id log error; do
       printf '%s=%s\n' "$k" "${kv[$k]:-}"
     done
   } >"${status_file}.tmp"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flash-test — Multi-Drive Flash QA Engine
+# flash-test — Single Flash Drive QA (run one instance per stick)
 set -euo pipefail
 
 FLASH_TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,6 +8,8 @@ FLASH_TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$FLASH_TEST_ROOT/lib/safety.sh"
 # shellcheck source=lib/detector.sh
 source "$FLASH_TEST_ROOT/lib/detector.sh"
+# shellcheck source=lib/selection.sh
+source "$FLASH_TEST_ROOT/lib/selection.sh"
 # shellcheck source=lib/reporter.sh
 source "$FLASH_TEST_ROOT/lib/reporter.sh"
 # shellcheck source=lib/tests/test_fake.sh
@@ -25,50 +27,53 @@ source "$FLASH_TEST_ROOT/lib/tui.sh"
 
 usage() {
   cat <<'EOF'
-flash-test — Multi-Drive Flash QA Engine
+flash-test — Single Flash Drive QA
+
+Tests ONE removable drive per process. Run multiple terminals/instances
+yourself to test several sticks in parallel (use a different --state-file
+per instance so each remembers its own UUID).
 
 Usage:
-  flash-test                          Interactive TUI drive picker
+  flash-test                          Interactive: pick one drive
   flash-test --interactive
-  flash-test --quick DEV [DEV...]
-  flash-test --all [--mode quick|full] [options]
-  flash-test --non-destructive DEV
-  flash-test --allow-loop /dev/loopN  Mock/CI loop devices
+  flash-test --use-saved              Reuse last saved UUID/drive
+  flash-test --show-selection         Print saved UUID and exit
+  flash-test --clear-selection        Clear saved selection
+  flash-test /dev/sdb                 Test this device
+  flash-test --non-destructive /dev/sde
+  flash-test --allow-loop /dev/loop0
 
 Options:
   --mode MODE           quick (default) | full | non-destructive
-  --jobs N              Concurrent drive pipelines (default: 2)
-  --write-jobs N        Max concurrent write stages (default: min(jobs,2))
   --format FS           exfat (default) | vfat | ext4 | none
   --yes-format          Required for non-interactive formatting
-  --output DIR          Report directory (default: ./reports/<timestamp>)
-  --allow-loop          Allow losetup loop devices as targets
-  --list                List safe removable targets and exit
+  --output DIR          Report directory (default: ./reports/<uuid>/<timestamp>)
+  --state-file PATH     Where to save this instance's drive selection
+  --allow-loop          Allow losetup loop devices
+  --list                List safe removable targets (with UUID)
   --timeout-fake SEC    Default 1800
   --timeout-surface SEC Default 21600
   --timeout-speed SEC   Default 1800
   --timeout-format SEC  Default 600
   -h, --help            Show this help
 
-Safety:
-  Only RM=1 disks (or --allow-loop) that are not the root disk and have no
-  system mounts are accepted. Devices are pinned via /dev/disk/by-id.
-  Formatting requires TUI typed "yes" or CLI --yes-format.
+Selection is saved under ./state/selected.conf (or --state-file).
+The TUI shows and restores the selected UUID on the next launch.
 EOF
 }
 
 main() {
   local interactive=0
-  local use_all=0
+  local use_saved=0
   local list_only=0
+  local show_sel=0
+  local clear_sel=0
   local allow_loop=0
   local yes_format=0
   local mode="quick"
-  local jobs=2
-  local write_jobs=""
   local format="exfat"
   local output=""
-  local -a user_devs=()
+  local user_dev=""
 
   FLASH_TEST_TIMEOUT_FAKE=1800
   FLASH_TEST_TIMEOUT_SURFACE=21600
@@ -76,7 +81,6 @@ main() {
   FLASH_TEST_TIMEOUT_FORMAT=600
   FLASH_TEST_FORMAT_CONFIRMED=0
   FLASH_TEST_FORMAT_OUTCOME_NOTE=""
-  FLASH_TEST_LIVE_DONE=0
 
   if (($# == 0)); then
     interactive=1
@@ -86,23 +90,22 @@ main() {
     case "$1" in
       -h|--help) usage; exit 0 ;;
       --interactive) interactive=1; shift ;;
-      --all) use_all=1; shift ;;
+      --use-saved) use_saved=1; shift ;;
+      --show-selection) show_sel=1; shift ;;
+      --clear-selection) clear_sel=1; shift ;;
       --list) list_only=1; shift ;;
       --allow-loop) allow_loop=1; shift ;;
       --yes-format) yes_format=1; shift ;;
-      --quick)
-        mode="quick"
-        shift
-        while (($# > 0)) && [[ "$1" != -* ]]; do
-          user_devs+=("$1"); shift
-        done
+      --state-file)
+        FLASH_TEST_STATE_FILE="$2"
+        shift 2
         ;;
       --non-destructive)
         mode="non-destructive"
         shift
-        while (($# > 0)) && [[ "$1" != -* ]]; do
-          user_devs+=("$1"); shift
-        done
+        if (($# > 0)) && [[ "$1" != -* ]]; then
+          user_dev="$1"; shift
+        fi
         ;;
       --mode)
         mode="$2"; shift 2
@@ -111,8 +114,6 @@ main() {
           *) echo "error: invalid --mode $mode" >&2; exit 2 ;;
         esac
         ;;
-      --jobs) jobs="$2"; shift 2 ;;
-      --write-jobs) write_jobs="$2"; shift 2 ;;
       --format)
         format="$2"; shift 2
         case "$format" in
@@ -126,10 +127,12 @@ main() {
       --timeout-surface) FLASH_TEST_TIMEOUT_SURFACE="$2"; shift 2 ;;
       --timeout-speed) FLASH_TEST_TIMEOUT_SPEED="$2"; shift 2 ;;
       --timeout-format) FLASH_TEST_TIMEOUT_FORMAT="$2"; shift 2 ;;
-      --)
+      --quick)
+        mode="quick"
         shift
-        user_devs+=("$@")
-        break
+        if (($# > 0)) && [[ "$1" != -* ]]; then
+          user_dev="$1"; shift
+        fi
         ;;
       -*)
         echo "error: unknown option: $1" >&2
@@ -137,198 +140,123 @@ main() {
         exit 2
         ;;
       *)
-        user_devs+=("$1"); shift
+        if [[ -n "$user_dev" ]]; then
+          echo "error: only one device allowed (got extra: $1)" >&2
+          exit 2
+        fi
+        user_dev="$1"
+        shift
         ;;
     esac
   done
 
-  require_root
+  if [[ $clear_sel -eq 1 ]]; then
+    selection_clear
+    echo "Cleared selection at $(selection_path)"
+    exit 0
+  fi
 
+  if [[ $show_sel -eq 1 ]]; then
+    selection_print "Saved"
+    exit 0
+  fi
+
+  require_root
   FLASH_TEST_FORMAT="$format"
   FLASH_TEST_ALLOW_LOOP="$allow_loop"
 
   if [[ $list_only -eq 1 ]]; then
     echo "Safe removable targets:"
+    local line
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
-      IFS='|' read -r by_id resolved serial vendor model size_b size_h usb <<<"$line"
-      printf '  %s  %s  %s  %s %s (%s)\n' "$resolved" "$serial" "$size_h" "$vendor" "$model" "$usb"
+      local by_id resolved serial vendor model size_b size_h usb uuid
+      IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$line"
+      printf '  UUID=%-24s  %-12s  %8s  %s %s\n' "$uuid" "$(basename "$resolved")" "$size_h" "$vendor" "$model"
     done < <(enumerate_removable_drives "$allow_loop")
+    echo ""
+    selection_print "Saved" || true
     exit 0
   fi
 
   check_dependencies
 
-  if [[ -z "$write_jobs" ]]; then
-    write_jobs="$jobs"
-    ((write_jobs > 2)) && write_jobs=2
-  fi
+  local meta=""
 
-  if [[ -z "$output" ]]; then
-    output="$FLASH_TEST_ROOT/reports/$(date +%Y%m%dT%H%M%S)"
-  fi
-
-  local -a metas=()
-
-  if [[ $interactive -eq 1 && ${#user_devs[@]} -eq 0 && $use_all -eq 0 ]]; then
+  if [[ $interactive -eq 1 && -z "$user_dev" && $use_saved -eq 0 ]]; then
     local pick_out
     pick_out="$(mktemp)"
-    if ! tui_pick_drives "$allow_loop" >"$pick_out"; then
+    if ! tui_pick_drive "$allow_loop" >"$pick_out"; then
       rm -f "$pick_out"
-      echo "No drives selected / quit." >&2
+      echo "No drive selected / quit." >&2
       exit 1
     fi
-    mapfile -t metas <"$pick_out"
+    meta="$(cat "$pick_out")"
     rm -f "$pick_out"
-  elif [[ $use_all -eq 1 ]]; then
-    mapfile -t metas < <(enumerate_removable_drives "$allow_loop")
-  elif ((${#user_devs[@]} > 0)); then
-    mapfile -t metas < <(resolve_user_targets "$allow_loop" "${user_devs[@]}")
+  elif [[ $use_saved -eq 1 ]]; then
+    if ! selection_load; then
+      echo "error: no saved selection (run interactively first)" >&2
+      exit 1
+    fi
+    echo "Using saved selection:" >&2
+    selection_print "Saved" >&2
+    meta="$(find_drive_by_saved "$allow_loop" "${SELECTION_UUID:-}" "${SELECTION_BY_ID:-}")" || {
+      echo "error: saved UUID ${SELECTION_UUID:-?} is not plugged in" >&2
+      exit 1
+    }
+    selection_save "$meta"
+  elif [[ -n "$user_dev" ]]; then
+    meta="$(resolve_one_target "$allow_loop" "$user_dev")" || {
+      echo "error: invalid / unsafe target: $user_dev" >&2
+      exit 1
+    }
+    selection_save "$meta"
   else
-    echo "error: no targets; use --interactive, --all, or pass device paths" >&2
+    echo "error: pass a device, --use-saved, or run with no args for the TUI" >&2
     exit 2
   fi
 
-  if ((${#metas[@]} == 0)); then
-    echo "error: no valid target drives" >&2
-    exit 1
-  fi
+  [[ -n "$meta" ]] || { echo "error: no target" >&2; exit 1; }
 
-  # Destructive banner for destructive modes
+  local by_id resolved serial vendor model size_b size_h usb uuid
+  IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$meta"
+
+  echo "" >&2
+  echo "Selected UUID: $uuid" >&2
+  echo "         device: $resolved  serial: $serial  $size_h" >&2
+  echo "         saved → $(selection_path)" >&2
+  echo "" >&2
+
   if [[ "$mode" != "non-destructive" ]]; then
     print_destructive_banner >&2
-    echo "Mode: $mode  Jobs: $jobs  Write-jobs: $write_jobs  Format: $FLASH_TEST_FORMAT" >&2
-    echo "Targets:" >&2
-    local m
-    for m in "${metas[@]}"; do
-      IFS='|' read -r by_id resolved serial vendor model size_b size_h usb <<<"$m"
-      printf '  %s (%s) %s\n' "$resolved" "$serial" "$size_h" >&2
-    done
+    echo "Mode: $mode  Format: $FLASH_TEST_FORMAT" >&2
     echo "" >&2
   fi
 
-  # Format confirmation
   if [[ -t 0 ]]; then
-    tui_confirm_format "$FLASH_TEST_FORMAT" "${metas[@]}" || exit 1
+    tui_confirm_format "$FLASH_TEST_FORMAT" "$meta" || exit 1
   else
     cli_confirm_format "$FLASH_TEST_FORMAT" "$yes_format" || exit 1
   fi
   format="$FLASH_TEST_FORMAT"
 
+  if [[ -z "$output" ]]; then
+    local safe
+    safe="$(echo "$uuid" | tr -c 'A-Za-z0-9._-' '_')"
+    output="$FLASH_TEST_ROOT/reports/${safe}/$(date +%Y%m%dT%H%M%S)"
+  fi
   mkdir -p "$output"
-  rm -f "$output/.live_done"
   echo "Reports → $output" >&2
 
-  # Run batch in background so live TUI can poll; only the parent may wait on it.
   local batch_rc=0
   (
-    # Keep worker stdout/stderr out of the TUI; stages already append to per-drive logs.
-    runner_run_batch "$jobs" "$write_jobs" "$output" "$mode" "$format" "${metas[@]}" \
-      >/dev/null 2>&1
-  ) &
-  local batch_pid=$!
+    runner_run_one "$meta" "$output" "$mode" "$format"
+  ) >/dev/null 2>&1 &
+  local worker_pid=$!
 
-  _live_until_done() {
-    local report_dir="$1"
-    local focus=0
-    local key
-    local batch_done=0
+  tui_live_one "$output" "$worker_pid" "$uuid"
+  wait "$worker_pid" || batch_rc=$?
 
-    _batch_finished() {
-      if ! kill -0 "$batch_pid" 2>/dev/null; then
-        return 0
-      fi
-      return 1
-    }
-
-    if [[ ! -t 1 ]]; then
-      while ! _batch_finished; do sleep 0.5; done
-      return 0
-    fi
-
-    tui_alt_on
-    tui_hide_cursor
-    stty -echo -icanon time 1 min 0 2>/dev/null || true
-    trap 'tui_show_cursor; stty echo icanon 2>/dev/null || true; tui_alt_off' EXIT
-
-    while true; do
-      local -a status_files=()
-      mapfile -t status_files < <(find "$report_dir" -maxdepth 1 -name '*.status' 2>/dev/null | sort)
-      if ((focus >= ${#status_files[@]} && ${#status_files[@]} > 0)); then
-        focus=$((${#status_files[@]} - 1))
-      fi
-      tui_clear
-      printf 'DEV            SERIAL           STATUS     STEP        PROGRESS  SPEED              RESULT\n'
-      printf '─────────────────────────────────────────────────────────────────────────────────────────────\n'
-      local sf i=0 focused_log=""
-      for sf in "${status_files[@]:-}"; do
-        local dev serial st step prog speed result log
-        dev="$(reporter_get "$sf" dev)"
-        serial="$(reporter_get "$sf" serial)"
-        st="$(reporter_get "$sf" status)"
-        step="$(reporter_get "$sf" step)"
-        prog="$(reporter_get "$sf" progress)"
-        speed="$(reporter_get "$sf" speed)"
-        result="$(reporter_get "$sf" result)"
-        log="$(reporter_get "$sf" log)"
-        local marker=" "
-        if ((i == focus)); then marker=">"; focused_log="$log"; fi
-        printf '%s%-13s %-16s %-10s %-11s %-9s %-18s %s\n' \
-          "$marker" "$(basename "${dev:-?}")" "${serial:0:16}" "${st:0:10}" \
-          "${step:0:11}" "${prog:0:9}" "${speed:0:18}" "$result"
-        i=$((i + 1))
-      done
-      ((${#status_files[@]} == 0)) && echo "(waiting for workers…)"
-      printf '\n── log'
-      [[ -n "$focused_log" ]] && printf ' (%s)' "$(basename "$focused_log")"
-      printf '  [j/k focus · q detach] ──\n'
-      if [[ -n "$focused_log" && -f "$focused_log" ]]; then
-        tail -n 12 "$focused_log" 2>/dev/null || true
-      else
-        echo "(no log yet)"
-      fi
-
-      if _batch_finished; then
-        batch_done=1
-        echo ""
-        echo "══ batch complete — press any key ══"
-        stty -echo -icanon time 0 min 1 2>/dev/null || true
-        IFS= read -r -n1 _ || true
-        break
-      fi
-
-      key=""
-      IFS= read -r -n1 -t 0.5 key || true
-      if [[ "$key" == $'\033' ]]; then
-        local r1 r2
-        IFS= read -r -n1 -t 0.05 r1 || true
-        IFS= read -r -n1 -t 0.05 r2 || true
-        [[ "$r2" == "A" ]] && key="k"
-        [[ "$r2" == "B" ]] && key="j"
-      fi
-      case "$key" in
-        q|Q) break ;;
-        j) ((${#status_files[@]} > 0)) && focus=$(( (focus + 1) % ${#status_files[@]} )) ;;
-        k) ((${#status_files[@]} > 0)) && focus=$(( (focus - 1 + ${#status_files[@]} ) % ${#status_files[@]} )) ;;
-      esac
-    done
-
-    tui_show_cursor
-    stty echo icanon 2>/dev/null || true
-    tui_alt_off
-    trap - EXIT
-
-    # If user detached early, wait quietly for batch to finish.
-    if [[ $batch_done -eq 0 ]]; then
-      echo "Detached from live view — waiting for batch to finish…" >&2
-      while ! _batch_finished; do sleep 0.5; done
-    fi
-  }
-
-  _live_until_done "$output"
-  wait "$batch_pid" || batch_rc=$?
-  echo 1 >"$output/.live_done"
-  # Annotate skipped_no_confirm on status files if needed
   if [[ -n "$FLASH_TEST_FORMAT_OUTCOME_NOTE" ]]; then
     local sf
     for sf in "$output"/*.status; do
@@ -339,33 +267,28 @@ main() {
         reporter_set_status "$sf" format_outcome "$FLASH_TEST_FORMAT_OUTCOME_NOTE"
       fi
     done
-    mapfile -t FLASH_TEST_STATUS_FILES < <(find "$output" -maxdepth 1 -name '*.status' | sort)
-    reporter_write_summary "$output" "${FLASH_TEST_STATUS_FILES[@]:-}"
+    mapfile -t _sfs < <(find "$output" -maxdepth 1 -name '*.status' | sort)
+    if ((${#_sfs[@]})); then
+      reporter_write_summary "$output" "${_sfs[@]}"
+    fi
   fi
 
   echo ""
-  echo "Final results:"
-  local passed=0 failed=0
-  local sf
-  for sf in "$output"/*.status; do
-    [[ -f "$sf" ]] || continue
-    local result serial dev
+  echo "Selected UUID: $uuid"
+  local sf result
+  sf="$(find "$output" -maxdepth 1 -name '*.status' | sort | tail -n1 || true)"
+  if [[ -n "$sf" ]]; then
     result="$(reporter_get "$sf" result)"
-    serial="$(reporter_get "$sf" serial)"
-    dev="$(reporter_get "$sf" dev)"
-    printf '  %s  %s  %s\n' "$(basename "$dev")" "$serial" "$result"
-    if [[ "$result" == "PASSED" ]]; then
-      passed=$((passed + 1))
-    else
-      failed=$((failed + 1))
-    fi
-  done
-  echo "Passed: $passed  Failed: $failed"
-  echo "Summary: $output/summary.json  $output/summary.csv"
+    echo "Result: $result"
+    echo "Log:    $(reporter_get "$sf" log)"
+  fi
+  echo "Summary: $output/summary.json"
+  selection_print "Saved"
 
-  if [[ $batch_rc -ne 0 || $failed -gt 0 ]]; then
+  if [[ $batch_rc -ne 0 ]]; then
     exit 1
   fi
+  [[ "${result:-}" == "PASSED" ]] || exit 1
   exit 0
 }
 

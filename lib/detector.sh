@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Hardware enumeration and metadata extraction.
+# Hardware enumeration and metadata extraction (single-drive).
 
 set -euo pipefail
 
-# Human-readable size from bytes
 _human_size() {
   local bytes="${1:-0}"
   awk -v b="$bytes" 'BEGIN {
@@ -16,21 +15,18 @@ _human_size() {
   }'
 }
 
-# Query a single udev property
 _udev_prop() {
   local dev="$1" key="$2"
   udevadm info --query=property --name="$dev" 2>/dev/null \
     | grep -E "^${key}=" | head -n1 | cut -d= -f2- || true
 }
 
-# Best-effort USB speed string
 _usb_speed() {
   local dev="$1"
   local speed id_bus
   id_bus="$(_udev_prop "$dev" ID_BUS)"
   if [[ "$id_bus" != "usb" ]]; then
-    # loop or other
-    if [[ "$(basename "$(realpath -e "$dev")")" == loop* ]]; then
+    if [[ "$(basename "$(realpath -e "$dev" 2>/dev/null || echo)")" == loop* ]]; then
       echo "loop"
       return 0
     fi
@@ -39,13 +35,10 @@ _usb_speed() {
   fi
   speed="$(_udev_prop "$dev" ID_USB_SPEED)"
   if [[ -z "$speed" ]]; then
-    # Fallback: walk sysfs
-    local sys
+    local sys d
     sys="$(udevadm info -q path -n "$dev" 2>/dev/null || true)"
-    if [[ -n "$sys" && -r "/sys${sys}/../speed" ]]; then
-      speed="$(cat "/sys${sys}/../speed" 2>/dev/null || true)"
-    elif [[ -n "$sys" ]]; then
-      local d="/sys${sys}"
+    if [[ -n "$sys" ]]; then
+      d="/sys${sys}"
       while [[ "$d" != "/sys" && ! -r "$d/speed" ]]; do
         d="$(dirname "$d")"
       done
@@ -61,12 +54,28 @@ _usb_speed() {
   esac
 }
 
-# Collect metadata for one device. Prints pipe-delimited fields:
-# by_id|resolved|serial|vendor|model|size_bytes|size_human|usb_speed
+# Stable UUID for a stick: prefer partition-table UUID, else serial, else by-id name.
+_device_uuid() {
+  local resolved="$1" by_id="$2" serial="$3"
+  local uuid
+  uuid="$(_udev_prop "$resolved" ID_PART_TABLE_UUID)"
+  if [[ -z "$uuid" ]]; then
+    uuid="$(_udev_prop "$resolved" ID_FS_UUID)"
+  fi
+  if [[ -z "$uuid" ]]; then
+    uuid="$serial"
+  fi
+  if [[ -z "$uuid" ]]; then
+    uuid="$(basename "$by_id")"
+  fi
+  echo "$uuid"
+}
+
+# Fields: by_id|resolved|serial|vendor|model|size_bytes|size_human|usb_speed|uuid
 collect_device_metadata() {
   local dev="$1"
   local allow_loop="${2:-0}"
-  local by_id resolved serial vendor model size_b size_h usb
+  local by_id resolved serial vendor model size_b size_h usb uuid
 
   if ! validate_target_device "$dev" "$allow_loop"; then
     return 1
@@ -75,34 +84,31 @@ collect_device_metadata() {
   by_id="$(pin_device_by_id "$dev")" || return 1
   resolved="$(realpath -e "$by_id")"
   serial="$(_udev_prop "$resolved" ID_SERIAL_SHORT)"
-  if [[ -z "$serial" ]]; then
-    serial="$(_udev_prop "$resolved" ID_SERIAL)"
-  fi
-  if [[ -z "$serial" ]]; then
-    serial="$(basename "$by_id" | tr '/' '_')"
-  fi
+  [[ -z "$serial" ]] && serial="$(_udev_prop "$resolved" ID_SERIAL)"
+  [[ -z "$serial" ]] && serial="$(basename "$by_id" | tr '/' '_')"
+
   vendor="$(_udev_prop "$resolved" ID_VENDOR)"
   [[ -z "$vendor" ]] && vendor="$(_udev_prop "$resolved" ID_VENDOR_FROM_DATABASE)"
   model="$(_udev_prop "$resolved" ID_MODEL)"
   [[ -z "$model" ]] && model="$(_udev_prop "$resolved" ID_MODEL_FROM_DATABASE)"
   vendor="${vendor:-unknown}"
   model="${model:-unknown}"
+
   size_b="$(lsblk -b -dn -o SIZE "$resolved" 2>/dev/null | tr -d '[:space:]')"
   size_b="${size_b:-0}"
   size_h="$(_human_size "$size_b")"
   usb="$(_usb_speed "$resolved")"
+  uuid="$(_device_uuid "$resolved" "$by_id" "$serial")"
 
-  # Sanitize for pipe-delimited output
   serial="${serial//|/}"
   vendor="${vendor//|/}"
   model="${model//|/}"
+  uuid="${uuid//|/}"
 
-  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
-    "$by_id" "$resolved" "$serial" "$vendor" "$model" "$size_b" "$size_h" "$usb"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$by_id" "$resolved" "$serial" "$vendor" "$model" "$size_b" "$size_h" "$usb" "$uuid"
 }
 
-# Enumerate all candidate removable (or loop) disks.
-# Prints one metadata line per device.
 enumerate_removable_drives() {
   local allow_loop="${1:-0}"
   local name typ rm
@@ -122,19 +128,30 @@ enumerate_removable_drives() {
   done < <(lsblk -dpno NAME,RM,TYPE 2>/dev/null | sed 's|^/dev/||' | awk '{print $1,$2,$3}')
 }
 
-# Resolve user-supplied args into metadata lines (deduped by resolved path).
-resolve_user_targets() {
+# Resolve a single user device path to one metadata line.
+resolve_one_target() {
   local allow_loop="${1:-0}"
-  shift
-  local seen="" meta resolved
-  local arg
-  for arg in "$@"; do
-    meta="$(collect_device_metadata "$arg" "$allow_loop")" || continue
-    resolved="$(cut -d'|' -f2 <<<"$meta")"
-    if [[ " $seen " == *" $resolved "* ]]; then
-      continue
+  local arg="$2"
+  collect_device_metadata "$arg" "$allow_loop"
+}
+
+# Find metadata matching a saved UUID or by-id among currently plugged drives.
+find_drive_by_saved() {
+  local allow_loop="${1:-0}"
+  local want_uuid="${2:-}"
+  local want_by_id="${3:-}"
+  local line by_id resolved serial vendor model size_b size_h usb uuid
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$line"
+    if [[ -n "$want_uuid" && "$uuid" == "$want_uuid" ]]; then
+      printf '%s\n' "$line"
+      return 0
     fi
-    seen+=" $resolved"
-    printf '%s\n' "$meta"
-  done
+    if [[ -n "$want_by_id" && "$by_id" == "$want_by_id" ]]; then
+      printf '%s\n' "$line"
+      return 0
+    fi
+  done < <(enumerate_removable_drives "$allow_loop")
+  return 1
 }
