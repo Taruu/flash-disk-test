@@ -60,8 +60,16 @@ tui_pick_drive() {
   _reload
   tui_alt_on
   tui_hide_cursor
-  stty -echo 2>/dev/null || true
-  trap 'tui_show_cursor; stty echo 2>/dev/null || true; tui_alt_off' EXIT
+  # -icanon so Enter arrives as $'\n' (with icanon, read -n1 often sees "")
+  stty -echo -icanon min 1 time 0 2>/dev/null || true
+  trap 'tui_show_cursor; stty echo icanon 2>/dev/null || true; tui_alt_off' EXIT
+
+  _restore_tty() {
+    tui_show_cursor
+    stty echo icanon 2>/dev/null || true
+    tui_alt_off
+    trap - EXIT
+  }
 
   while true; do
     _draw >&2
@@ -79,8 +87,7 @@ tui_pick_drive() {
     fi
     case "$key" in
       q|Q)
-        tui_show_cursor; stty echo 2>/dev/null || true; tui_alt_off
-        trap - EXIT
+        _restore_tty
         return 1
         ;;
       r|R) _reload ;;
@@ -90,12 +97,12 @@ tui_pick_drive() {
       k)
         ((${#metas[@]} > 0)) && cursor=$(( (cursor - 1 + ${#metas[@]} ) % ${#metas[@]} ))
         ;;
-      $'\n'|$'\r'|c|C)
+      ""|$'\n'|$'\r'|c|C)
+        # "" = Enter under some tty modes; c kept as alternate confirm
         if ((${#metas[@]} == 0)); then
           continue
         fi
-        tui_show_cursor; stty echo 2>/dev/null || true; tui_alt_off
-        trap - EXIT
+        _restore_tty
         printf '%s\n' "${metas[$cursor]}"
         return 0
         ;;
