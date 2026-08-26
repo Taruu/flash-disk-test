@@ -95,20 +95,14 @@ main() {
   local do_format
   do_format="$(tui_confirm_format "$meta")"
 
-  start_pipeline_bg "$meta" "$do_format"
-  local worker_pid="$FLASH_TEST_CHILD_PID"
-  local log_file="$FLASH_TEST_LOG"
-  local step_file="$FLASH_TEST_STEP_FILE"
-
-  echo "Log file: $log_file" >&2
   local rc=0
-  tui_live_run "$worker_pid" "$step_file" "$log_file" "$uuid" "$resolved" || rc=$?
+  run_pipeline_fg "$meta" "$do_format" || rc=$?
 
   local result
-  result="$(_step_get "$step_file" result)"
+  result="$(_step_get "$FLASH_TEST_STEP_FILE" result)"
   echo "" >&2
   echo "Result: ${result:-?}  (exit $rc)" >&2
-  echo "Log:    $log_file" >&2
+  echo "Log:    $FLASH_TEST_LOG" >&2
   exit "$rc"
 }
 

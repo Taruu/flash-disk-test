@@ -437,23 +437,30 @@ run_drive_pipeline() {
   return 0
 }
 
-# Background worker: run pipeline with tee to log.
-# Sets FLASH_TEST_LOG / FLASH_TEST_STEP_FILE; prints worker PID on stdout last? 
-# Caller should: start_pipeline_bg meta do_format  → sets FLASH_TEST_CHILD_PID
-start_pipeline_bg() {
+# Foreground run: stream tool stdout/stderr as-is while tee'ing to the log.
+# No alt-screen / clear — progress from badblocks/f3/etc. shows naturally.
+run_pipeline_fg() {
   local meta="$1"
   local do_format="${2:-1}"
-  local uuid
+  local uuid resolved
   uuid="$(awk -F'|' '{print $9}' <<<"$meta")"
+  resolved="$(awk -F'|' '{print $2}' <<<"$meta")"
 
   prepare_log_paths "$uuid" >/dev/null
   printf 'step=init\nstatus=RUNNING\nresult=PENDING\nlog=%s\n' "$FLASH_TEST_LOG" \
     >"$FLASH_TEST_STEP_FILE"
 
-  (
-    # shellcheck disable=SC2030
-    run_drive_pipeline "$meta" "$do_format" 2>&1 | tee -a "$FLASH_TEST_LOG"
-    exit "${PIPESTATUS[0]}"
-  ) &
-  FLASH_TEST_CHILD_PID=$!
+  echo "" >&2
+  echo "══ Running on $resolved (UUID $uuid) ══" >&2
+  echo "Log: $FLASH_TEST_LOG" >&2
+  echo "Tool output follows (not cleared):" >&2
+  echo "" >&2
+
+  set +e
+  set -o pipefail
+  run_drive_pipeline "$meta" "$do_format" 2>&1 | tee -a "$FLASH_TEST_LOG"
+  local rc=${PIPESTATUS[0]}
+  set +o pipefail
+  set -e
+  return "$rc"
 }

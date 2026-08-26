@@ -29,7 +29,7 @@ sudo ./flash-test
 - `r` — refresh list
 - `q` — quit
 
-Live output is shown in the TUI and saved to:
+Live tool output streams to the terminal (and is saved under):
 
 ```text
 logs/<uuid>/<YYYYMMDDTHHMMSS>.log
