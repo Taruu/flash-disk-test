@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# flash-test — Simple one-drive flash QA (TUI)
+set -euo pipefail
+
+FLASH_TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=lib/safety.sh
+source "$FLASH_TEST_ROOT/lib/safety.sh"
+# shellcheck source=lib/detect.sh
+source "$FLASH_TEST_ROOT/lib/detect.sh"
+# shellcheck source=lib/run.sh
+source "$FLASH_TEST_ROOT/lib/run.sh"
+# shellcheck source=lib/tui.sh
+source "$FLASH_TEST_ROOT/lib/tui.sh"
+
+usage() {
+  cat <<'EOF'
+flash-test — Simple one-drive flash tester
+
+Destructive pipeline (one stick per run):
+  f3probe --destructive → badblocks -wsv → smartctl → hdparm → mkfs.exfat → fsck
+
+Usage:
+  flash-test              Interactive TUI: pick one drive
+  flash-test --list       List safe removable targets
+  flash-test --help
+
+Logs:
+  logs/<uuid>/<YYYYMMDDTHHMMSS>.log
+EOF
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --list)
+      list_drives_human
+      exit 0
+      ;;
+    "")
+      ;;
+    *)
+      echo "error: unknown argument: $1 (this app is TUI-only; use --list or --help)" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+
+  require_root
+  check_dependencies
+
+  local meta
+  if ! meta="$(tui_pick_drive)"; then
+    echo "Aborted (no drive selected)." >&2
+    exit 1
+  fi
+  [[ -n "$meta" ]] || { echo "error: empty selection" >&2; exit 1; }
+
+  local by_id resolved serial vendor model size_b size_h usb uuid
+  IFS='|' read -r by_id resolved serial vendor model size_b size_h usb uuid <<<"$meta"
+
+  if ! tui_confirm_destructive "$meta"; then
+    echo "Aborted." >&2
+    exit 1
+  fi
+
+  local do_format
+  do_format="$(tui_confirm_format "$meta")"
+
+  start_pipeline_bg "$meta" "$do_format"
+  local worker_pid="$FLASH_TEST_CHILD_PID"
+  local log_file="$FLASH_TEST_LOG"
+  local step_file="$FLASH_TEST_STEP_FILE"
+
+  echo "Log file: $log_file" >&2
+  local rc=0
+  tui_live_run "$worker_pid" "$step_file" "$log_file" "$uuid" "$resolved" || rc=$?
+
+  local result
+  result="$(_step_get "$step_file" result)"
+  echo "" >&2
+  echo "Result: ${result:-?}  (exit $rc)" >&2
+  echo "Log:    $log_file" >&2
+  exit "$rc"
+}
+
+main "$@"

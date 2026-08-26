@@ -1,0 +1,9 @@
+logs/
+*.log
+*.status
+*.step
+state/
+reports/
+*~
+*.swp
+.DS_Store
